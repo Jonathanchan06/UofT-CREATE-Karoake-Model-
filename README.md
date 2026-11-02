@@ -7,7 +7,7 @@ then recommends the best key and flags the hardest phrases.
 
 | Step | What it does | Status |
 |---|---|---|
-| 1. Song → target notes | Demucs separates the original vocals; basic-pitch turns them into notes (pitch, start, duration). This is the answer key. | Demucs only (see below) |
+| 1. Song → target notes | Demucs separates the original vocals; basic-pitch turns them into notes (pitgich, start, duration). This is the answer key. | Demucs only (see below) |
 | 2. Recording → pitch | PESTO tracks the pitch of a team recording every 10 ms (`program.py`). | Done |
 | 3. Pitch + target notes → labels | A scoring script compares the two and gives per-phrase scores (`accuracy`, `mean_cents_error`, timing scores). | Missing |
 | 4. Labels → model → predictions | Features from the target notes, model ladder (baseline → linear → XGBoost), `recommend_key` for the app (`ml/`). | Done, on fake data |
