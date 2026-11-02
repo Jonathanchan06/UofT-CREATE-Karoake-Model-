@@ -176,4 +176,6 @@ pyrightconfig.json
 
 
 separated/
+covers_data/
+originals_data/
 # End of https://www.toptal.com/developers/gitignore/api/python
