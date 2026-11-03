@@ -179,3 +179,5 @@ separated/
 covers_data/
 originals_data/
 # End of https://www.toptal.com/developers/gitignore/api/python
+# Labeling outputs: derived from copyrighted audio, never commit
+derived/

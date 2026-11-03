@@ -63,16 +63,21 @@ def phrase_features(notes, range_low, range_high, tempo, phrase_idx, num_phrases
     }
 
 
-def build_feature_table(phrases, singers, songs):
+def build_feature_table(phrases, singers, songs, num_phrases_by_song=None):
     """One feature row per phrase row, keeping ids and any label columns alongside.
 
     phrases: the phrases parquet as a DataFrame
     singers: singers.csv (singer_id, range_low_midi, range_high_midi)
     songs:   songs.csv (song_id, tempo_bpm, ...)
+    num_phrases_by_song: {song_id: phrase count from melodies/<song_id>.json}. Pass it for real
+        data: if a song's last phrases were rejected in every recording, counting from the rows
+        would come out short and phrase_position would disagree with recommend.py.
+        Without it, counts come from the rows (fine when every phrase has a row, as in fake data).
     """
     singer_by_id = singers.set_index("singer_id")
     tempo_by_song = songs.set_index("song_id")["tempo_bpm"]
-    num_phrases_by_song = phrases.groupby("song_id")["phrase_idx"].max() + 1
+    if num_phrases_by_song is None:
+        num_phrases_by_song = phrases.groupby("song_id")["phrase_idx"].max() + 1
 
     rows = []
     for row in phrases.itertuples(index=False):
