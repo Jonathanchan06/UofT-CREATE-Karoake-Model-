@@ -77,3 +77,21 @@ def test_matches_fake_data_generator():
         f = phrase_features(notes, 55, 68, tempo=140, phrase_idx=0, num_phrases=1)
         assert (f["max_above_range"], f["max_below_range"], f["biggest_leap_up"]) == (above, below, leap_up)
         assert f["notes_per_sec"] == pytest.approx(nps)
+
+
+def test_phrase_position_uses_melody_count_when_last_phrases_are_missing():
+    """A song with 10 phrases where only phrases 0-3 have rows (e.g. the rest were rejected)."""
+    import pandas as pd
+    from features import build_feature_table
+
+    phrases = pd.DataFrame({
+        "song_id": "a", "singer_id": "s1", "phrase_idx": [0, 3],
+        "target_notes": [NOTES, NOTES], "accuracy": [0.9, 0.8],
+    })
+    singers = pd.DataFrame({"singer_id": ["s1"], "range_low_midi": [55], "range_high_midi": [70]})
+    songs = pd.DataFrame({"song_id": ["a"], "tempo_bpm": [120]})
+
+    from_rows = build_feature_table(phrases, singers, songs)
+    from_melody = build_feature_table(phrases, singers, songs, num_phrases_by_song={"a": 10})
+    assert list(from_rows["phrase_position"]) == [0.0, 0.75]      # 3 / 4: wrong count
+    assert list(from_melody["phrase_position"]) == [0.0, 0.3]     # 3 / 10, matches recommend.py

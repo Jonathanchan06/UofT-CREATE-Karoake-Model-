@@ -1,6 +1,7 @@
 """Splits, metrics and run logging. Every split is grouped by song_id, so no song is ever in
 both train and test."""
 
+import json
 import os
 from pathlib import Path
 
@@ -16,13 +17,25 @@ LABEL = "accuracy"
 EXPERIMENT = "karaoke-accuracy"
 
 
+def count_phrases(melody_dir, song_ids):
+    """{song_id: number of phrases} from melodies/<song_id>.json, the same source recommend.py uses."""
+    counts = {}
+    for song_id in song_ids:
+        path = Path(melody_dir) / f"{song_id}.json"
+        if not path.exists():
+            raise ValueError(f"song {song_id!r} has phrase rows but no melody file at {path}")
+        counts[song_id] = len(json.loads(path.read_text())["phrases"])
+    return counts
+
+
 def load_dataset(data_dir, version):
     """Read phrases, singers and songs, and return (feature table, singers, songs)."""
     data_dir = Path(data_dir)
     phrases = pd.read_parquet(data_dir / f"phrases_{version}.parquet")
     singers = pd.read_csv(data_dir / "singers.csv")
     songs = pd.read_csv(data_dir / "songs.csv")
-    return build_feature_table(phrases, singers, songs), singers, songs
+    num_phrases = count_phrases(data_dir / "melodies", phrases["song_id"].unique())
+    return build_feature_table(phrases, singers, songs, num_phrases), singers, songs
 
 
 def split_holdout(table, test_frac=0.2, seed=0):
