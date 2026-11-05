@@ -14,4 +14,4 @@ jobs:
           cache: pip
       # basic-pitch is left out here on purpose (heavy); its test skips itself in CI
       - run: pip install -r ml/requirements.txt -r scorer/requirements.txt librosa pretty_midi soundfile
-      - run: python -m pytest ml scorer melody
+      - run: python -m pytest ml scorer melody pipeline
