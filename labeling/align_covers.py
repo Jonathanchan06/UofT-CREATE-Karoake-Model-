@@ -1,4 +1,4 @@
-"""Run the two-pass alignment on every cover of the chosen songs and summarise how it went.
+"""Run the two-pass alignment (with the pass 1b fine-tuning) on every cover of the chosen songs and summarise how it went.
 
 Writes (derived/, not in Git):
     alignment/<song_id>/<video id>.json      pass 1 result: key shift, octave, cost, time map
@@ -21,7 +21,8 @@ import pandas as pd
 import soundfile as sf
 
 import config
-from align import align_backing, backing_chroma, find_onsets, note_table, recording_octave
+from align import (align_backing, backing_chroma, find_onsets, note_table, onset_envelope,
+                   recording_octave, refine_alignment)
 from beep_check import render_beeps
 from pitch import track_file
 
@@ -36,11 +37,12 @@ def covers_of(folder):
             if r["id"] not in excluded and (config.COVER_STEMS_DIR / folder / r["id"] / "vocals.wav").exists()]
 
 
-def align_cover(song, melody, song_chroma, video_id):
-    """Both passes for one cover. Returns (summary row, alignment dict, notes DataFrame)."""
+def align_cover(song, melody, song_chroma, song_onsets, video_id):
+    """Pass 1, pass 1b and pass 2 for one cover. Returns (summary row, alignment dict, notes)."""
     stems = config.COVER_STEMS_DIR / song.folder / video_id
     cover_chroma, cover_loudness = backing_chroma(stems / "no_vocals.wav")
     alignment = align_backing(cover_chroma, cover_loudness, song_chroma)
+    alignment = refine_alignment(alignment, onset_envelope(stems / "no_vocals.wav"), song_onsets)
 
     frames = track_file(stems / "vocals.wav",
                         config.DERIVED_DIR / "pitch" / "covers" / song.song_id / f"{video_id}.parquet")
@@ -58,6 +60,8 @@ def align_cover(song, melody, song_chroma, video_id):
         "aligned": (alignment["cost"] <= config.MAX_ALIGN_COST
                     and abs(alignment["slope"] - 1) <= config.MAX_SLOPE_ERROR),
         "cost": round(alignment["cost"], 3), "slope": round(alignment["slope"], 3),
+        "refine_used": round(alignment["refine_used"], 2),
+        "refine_median_abs_ms": round(alignment["refine_median_abs_ms"], 0),
         "key_shift": alignment["key_shift"], "octave": octave, "transpose": alignment["transpose"],
         "song_start_s": round(alignment["song_start_s"], 1), "song_end_s": round(alignment["song_end_s"], 1),
         "notes_covered": len(covered), "onsets_found": round(len(found) / max(len(covered), 1), 2),
@@ -97,10 +101,11 @@ def main():
     for song in songs.itertuples(index=False):
         melody = json.loads((config.REAL_DATA_DIR / "melodies" / f"{song.song_id}.json").read_text())
         song_chroma, _ = backing_chroma(config.ORIGINAL_STEMS_DIR / song.folder / "no_vocals.wav")
+        song_onsets = onset_envelope(config.ORIGINAL_STEMS_DIR / song.folder / "no_vocals.wav")
         (out_dir / song.song_id).mkdir(parents=True, exist_ok=True)
 
         for i, (video_id, cover_wav) in enumerate(covers_of(song.folder)):
-            row, alignment, notes = align_cover(song, melody, song_chroma, video_id)
+            row, alignment, notes = align_cover(song, melody, song_chroma, song_onsets, video_id)
             rows.append(row)
             notes.to_parquet(out_dir / song.song_id / f"{video_id}.parquet", index=False)
             saved = {k: (v.round(3).tolist() if isinstance(v, np.ndarray) else v) for k, v in alignment.items()}

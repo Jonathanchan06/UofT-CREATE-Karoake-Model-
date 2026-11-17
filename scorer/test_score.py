@@ -159,3 +159,159 @@ def test_output_works_with_the_ml_feature_code(tmp_path):
     table = build_feature_table(df, singers, songs)
     assert len(table) == len(df)
     assert not table.drop(columns=["mean_onset_error_ms", "transpose_conf"]).select_dtypes("number").isna().any().any()
+
+# ---- Exact tests on clean synthetic pitch frames (agreed 2026-11-03, CLAUDE.md "Tests are split") ----
+# No noise or vibrato, so every planted error must come back exactly.
+
+def clean_frames(segments, total_s=7.0):
+    """Pitch frames (labeling/pitch.py format) from (midi or None, start_s, end_s) segments."""
+    t = np.round(np.arange(0, total_s, score.HOP_S), 6)
+    midi = np.full(len(t), np.nan)
+    for m, a, b in segments:
+        midi[(t >= a - 1e-9) & (t < b - 1e-9)] = np.nan if m is None else m
+    return pd.DataFrame({"time_s": t, "midi": midi, "confidence": np.where(np.isnan(midi), 0.1, 0.95)})
+
+
+def sung_as_written(phrases=MELODY, cents=0.0):
+    return [(p + cents / 100, s, s + d) for phrase in phrases for p, s, d in phrase]
+
+
+def test_exact_cents_errors_per_phrase(melody):
+    """Phrase 0 sung +30 cents (inside +/-50), phrase 1 sung +60 cents (outside)."""
+    segs = sung_as_written(MELODY[:1], 30) + sung_as_written(MELODY[1:], 60)
+    df = score.score_take(clean_frames(segs), melody, "s1", transpose=0)
+    assert df["accuracy"].tolist() == [1.0, 0.0]
+    assert df["mean_cents_error"].round(6).tolist() == [30.0, 60.0]
+    assert df["bias_cents"].round(6).tolist() == [30.0, 60.0]
+
+
+def test_tuning_cents_is_removed(melody):
+    """A song 24 cents flat of A440, sung exactly in its own tuning: perfect once tuning is passed."""
+    frames = clean_frames(sung_as_written(cents=-24))
+    without = score.score_take(frames, melody, "s1", transpose=0)
+    with_tuning = score.score_take(frames, melody, "s1", transpose=0, tuning_cents=-24)
+    assert without["mean_cents_error"].round(6).tolist() == [24.0, 24.0]
+    assert with_tuning["mean_cents_error"].round(6).tolist() == [0.0, 0.0]
+    assert (with_tuning["accuracy"] == 1.0).all()
+
+
+def test_known_onset_errors_exactly():
+    """onset_stats alone: note 2 sung 80 ms late, note 3 50 ms early, notes 1 and 4 on time."""
+    notes = MELODY[0]                       # 60 @0.5, 62 @1.0, 64 @1.5, 65 @2.0, 0.5 s each
+    sung = np.full(400, np.nan)
+    for (p, s, d), shift in zip(notes, [0.0, 0.08, -0.05, 0.0]):
+        sung[int(round((s + shift) / score.HOP_S)): int(round((s + d) / score.HOP_S))] = p
+    timing = score.onset_stats(sung, notes, score.Config())
+    assert timing["mean_onset_error_ms"] == pytest.approx((0 + 80 - 50 + 0) / 4)
+    assert timing["timing_accuracy"] == 1.0          # all within 100 ms
+    assert timing["missed_note_rate"] == 0.0
+
+
+def test_same_pitch_repeat_is_not_taken_from_the_previous_note():
+    """Two notes on the same pitch with a 60 ms breath between them, both on time. The old rule
+    took the end of the first note as the start of the second (an error of about -300 ms)."""
+    notes = [(60, 0.5, 0.44), (60, 1.0, 0.5)]
+    sung = np.full(200, np.nan)
+    sung[50:94] = 60
+    sung[100:150] = 60
+    timing = score.onset_stats(sung, notes, score.Config())
+    assert timing["mean_onset_error_ms"] == pytest.approx(0.0)
+    assert timing["timing_accuracy"] == 1.0
+
+
+def test_missed_means_not_sung_not_off_pitch():
+    """Note 2 sung 3 semitones wrong (not missed), note 3 silent (missed): 1 of 4 missed."""
+    notes = MELODY[0]
+    sung = np.full(400, np.nan)
+    for (p, s, d), extra in zip(notes, [0, 3, None, 0]):
+        if extra is not None:
+            sung[int(round(s / score.HOP_S)): int(round((s + d) / score.HOP_S))] = p + extra
+    assert score.onset_stats(sung, notes, score.Config())["missed_note_rate"] == 0.25
+
+
+def test_octave_glitch_is_forgiven_but_a_held_wrong_octave_is_not(melody):
+    """Phrase 0: a 100 ms jump up an octave inside a note (a tracker glitch). Phrase 1: its whole
+    third note (500 ms) sung an octave up."""
+    segs = sung_as_written()
+    segs += [(72, 0.70, 0.80)]               # glitch inside the 60 at 0.5-1.0
+    segs += [(79, 4.5, 5.0)]                 # 67 held an octave up
+    df = score.score_take(clean_frames(segs), melody, "s1", transpose=0)
+    glitch, held = df.iloc[0], df.iloc[1]
+    assert glitch["accuracy"] == 1.0 and glitch["accuracy_strict"] < 1.0
+    assert glitch["octave_error_rate"] > 0
+    assert held["accuracy"] == pytest.approx(held["accuracy_strict"])
+    assert held["accuracy"] == pytest.approx(1 - held["octave_error_rate"])
+    assert 0.6 < held["accuracy"] < 0.8      # one of four notes wrong (its first 50 ms are skipped)
+    assert held["phrase_octave"] == 0        # one note of four is not the whole phrase
+
+
+def test_whole_take_an_octave_down_goes_into_transpose(melody):
+    df = score.score_take(clean_frames(sung_as_written(cents=-1200)), melody, "s1", transpose=0)
+    assert (df["transpose"] == -12).all()
+    assert (df["accuracy"] == 1.0).all() and (df["octave_error_rate"] == 0).all()
+    assert df.iloc[0]["target_notes"][0]["midi_pitch"] == 60 - 12
+
+
+def test_frames_and_csv_give_the_same_labels(tmp_path, melody):
+    frames = clean_frames(sung_as_written(cents=20))
+    csv = tmp_path / "pitch.csv"
+    pd.DataFrame({"timestamp": frames["time_s"] * 1000,
+                  "frequency": 440 * 2 ** ((frames["midi"].fillna(60) - 69) / 12),
+                  "confidence": frames["confidence"]}).to_csv(csv, index=False)
+    a = score.score_take(frames, melody, "s1", transpose=0)
+    b = score.score_take(csv, melody, "s1", transpose=0)
+    assert a["accuracy"].round(6).tolist() == b["accuracy"].round(6).tolist()
+    assert a["mean_cents_error"].round(3).tolist() == b["mean_cents_error"].round(3).tolist()
+
+
+def test_short_notes_all_an_octave_down_are_not_forgiven_one_by_one(tmp_path):
+    """Four 120 ms notes with gaps, all an octave down in a take otherwise in the right octave.
+    Each note alone is shorter than the glitch limit, but together they are a held wrong octave."""
+    phrases = [[(60, 0.5, 0.5), (62, 1.0, 0.5), (64, 1.5, 0.5), (65, 2.0, 0.5)],
+               [(67, 3.5, 0.12), (69, 3.7, 0.12), (67, 3.9, 0.12), (64, 4.1, 0.12)],
+               [(60, 5.0, 0.5), (62, 5.5, 0.5), (64, 6.0, 0.5), (65, 6.5, 0.5)]]
+    melody = write_melody(tmp_path / "m.json", phrases)
+    segs = sung_as_written(phrases[:1]) + [(p - 12, s, s + d) for p, s, d in phrases[1]] + sung_as_written(phrases[2:])
+    # with whole-phrase octave moves switched off, this tests the glitch rule on its own
+    df = score.score_take(clean_frames(segs, total_s=8.0), melody, "s1", transpose=0,
+                          cfg=score.Config(min_scored_frames=5, phrase_octave_share=None))
+    assert (df["transpose"] == 0).all()
+    short = df[df.phrase_idx == 1].iloc[0]
+    assert short["accuracy"] == 0.0 and short["octave_error_rate"] == 1.0
+
+
+
+THREE = MELODY + [[(60, 6.0, 0.5), (62, 6.5, 0.5), (64, 7.0, 0.5), (65, 7.5, 0.5)]]
+
+
+def moved_middle_phrase(tmp_path, cents):
+    """Phrases 0 and 2 sung as written, phrase 1 moved by `cents`: the take's octave stays 0."""
+    melody = write_melody(tmp_path / "three.json", THREE)
+    segs = sung_as_written(THREE[:1]) + sung_as_written(THREE[1:2], cents) + sung_as_written(THREE[2:])
+    df = score.score_take(clean_frames(segs, total_s=9.0), melody, "s1", transpose=0)
+    assert (df["transpose"] == 0).all()
+    return df.set_index("phrase_idx")
+
+
+def test_whole_phrase_one_octave_up_counts_as_right_but_not_strict(tmp_path):
+    df = moved_middle_phrase(tmp_path, 1200)
+    assert df.loc[1, "phrase_octave"] == 1
+    assert df.loc[1, "accuracy"] == 1.0
+    assert df.loc[1, "accuracy_strict"] == 0.0 and df.loc[1, "octave_error_rate"] == 1.0
+    assert df.loc[0, "phrase_octave"] == 0 and df.loc[0, "accuracy"] == 1.0
+
+
+def test_whole_phrase_one_octave_down_counts_as_right(tmp_path):
+    df = moved_middle_phrase(tmp_path, -1200)
+    assert df.loc[1, "phrase_octave"] == -1 and df.loc[1, "accuracy"] == 1.0
+
+
+def test_two_octaves_away_is_not_allowed(tmp_path):
+    df = moved_middle_phrase(tmp_path, 2400)
+    assert df.loc[1, "phrase_octave"] == 0 and df.loc[1, "accuracy"] == 0.0
+
+
+def test_phrase_octave_wrong_notes_still_count_wrong(tmp_path):
+    """An octave up AND a semitone sharp: the octave is forgiven, the semitone is not."""
+    df = moved_middle_phrase(tmp_path, 1300)
+    assert df.loc[1, "phrase_octave"] == 1 and df.loc[1, "accuracy"] == 0.0

@@ -1,7 +1,9 @@
 # Karaoke ML Coach: ML model context
 
-This file gives Claude Code the context for the ML side of a UofT CREATE team project.
-Read it before writing code. Ask before changing anything listed under "Fixed decisions".
+This file gives Claude Code the context for the ML side of a UofT CREATE team project: rules,
+decisions and the data format. **Progress, results and next steps are in `roadmap.md`**: read it at
+the start of every session and update it when a step finishes. Read both before writing code. Ask
+before changing anything listed under "Fixed decisions".
 
 ## Project in one paragraph
 
@@ -17,27 +19,23 @@ builds the audio pipeline that produces labeled training data.
 ## Where this repo sits in the pipeline
 
 1. **Data team (separate code, already cloned here for reference):** Demucs separates vocals from
-   the original song; PESTO plus note segmentation turns them into **target notes**, the answer key.
-   (basic-pitch may be added later as an alternative note maker; see "Labeling decisions".)
+   the original song; PESTO plus note segmentation (`labeling/targets.py`) turns them into **target
+   notes**, the answer key. `melody/extract_melody.py` (Arshiya) does the same with basic-pitch or a
+   MIDI file; which one to keep is **open** (see "Teammate code on main").
 2. **Data team:** each recording (team or cover) is pitch-tracked with **PESTO** (not CREPE), aligned
-   to the target notes, and scored per phrase by a rule-based script. Those scores are the **labels**.
-   Covers need Demucs first to remove the backing track.
+   to the target notes, and scored per phrase by a rule-based script (`scorer/score.py`). Those scores
+   are the **labels**. Covers need Demucs first, then the two-pass alignment (`labeling/align.py`).
 3. **ML team (this code):** load labeled phrases, compute features from the target notes, train
    and evaluate models, and expose a `predict` function for the app team.
 
 Do not modify the data team's Demucs code. The ML code should depend only on the data format below.
 
-## Current status (Nov 2026)
+## Current status (snapshot 2026-11-17; details in `roadmap.md`)
 
-- Cover recordings have been collected and separated with Demucs (`separated/htdemucs/`; originals
-  not yet separated), but **no real labels exist yet**: there are no target notes and no scoring
-  script. Labeling decisions are below. Target notes exist for the 5 pilot songs (beep check passed by
-  ear). Two-pass alignment is built, trialled on the 50 pilot covers and **approved** (2026-11-03);
-  it needs a fine-tuning step next. The scorer is not built yet. See "Next steps" below. Keep building on fake data, in the exact
-  real format, so swapping in the real file later needs no code changes.
-- Team recordings do not exist yet.
-- Baseline, linear regression and XGBoost are built and tested on fake data. The hierarchical model
-  (ladder step 4) and the leave-one-singer-out test are **not built**.
+- Labeling runs end to end on 5 pilot songs: `ml/data/real/phrases_v1.0.parquet` (1,362 phrases,
+  34 cover singers). Next: a plumbing run of `ml/` on it (roadmap step 5), then scale up to every song.
+- The ML code (baseline, linear, XGBoost, `recommend.py`) is tested on fake data only. The
+  hierarchical model and the leave-one-singer-out test are not built. Team recordings do not exist yet.
 - No large public amateur karaoke dataset was found (DAMP is not available), so plan for **small
   data**. Do not design around pretraining.
 
@@ -56,23 +54,29 @@ songs, 62.5 hours, 40 GB.
 
 **Clean up before Demucs** (do not delete originals; list exclusions in a file):
 - Merge `EdSheeran - Perfect` into `Ed Sheeran - Perfect` (they share video `9g_fTJwjJUc`).
-- Exclude `Mr. Rabbit - I Will Survive` (99% silent).
-- Check by ear: `Daiwey1` (Sk8er Boi), `MINIMALISMO MUSICAL` (Girls Just Want to Have Fun), and the
-  `Sorry - Justin Bieber dance cover`.
+- Exclude video `8cJQc8llWLg` (I Will Survive, 99% silent).
+- Check by ear: videos `oasL_TDbe4g` (Sk8er Boi), `i4xE1K6brA0` (Girls Just Want to Have Fun) and
+  `po94Wr7Lev8` (Sorry, a dance cover).
+- In anything committed (this file included), refer to recordings by video id, never uploader name.
 
-**Problems the scoring script must handle before these are valid labels:**
-- **Target notes:** none exist, and the originals or MIDI files are not in `covers_data/`.
-- **Key:** covers may be in a different key and the manifest has no transpose, so estimate it per cover.
+**Problems with covers as labels, and how they are handled:**
+- **Target notes:** not in `covers_data/`; made from the originals in `originals_data/`.
+- **Key:** covers may be in a different key and the manifest has no transpose; pass 1 of the
+  alignment estimates it per cover (all 12 keys tried).
 - **Alignment:** 205 recordings differ by over 20% from their song's median length (excerpts or
-  rearrangements), so one fixed time offset is not enough. Reject recordings that do not align.
+  rearrangements), so one fixed time offset is not enough. Two-pass alignment; recordings that do
+  not align are rejected (16 of 50 in the pilot).
 - **Multiple voices:** Smule duets are common and often unlabelled. PESTO tracks one pitch and Demucs
-  puts both singers in one stem, so duets must be detected and rejected, not trusted from titles.
-- **Pitch correction:** Smule offers it, so accuracy may be too high. Check before trusting these labels.
-- **Singer range:** no sweeps exist; estimate from the notes each singer sings accurately.
+  puts both singers in one stem, so duets must be detected, not trusted from titles. `duet_flag`
+  marks them (threshold untested on a real duet).
+- **Pitch correction:** Smule offers it, so accuracy may be too high. `pitch_correction_flag` marks
+  covers with too much singing exactly on a semitone (none in the pilot).
+- **Singer range:** no sweeps exist. Every cover singer gets one default range (see "Labeling
+  decisions"); never estimate it from the notes sung accurately (leaks the label).
 - **Singer identity:** an uploader is not always one person. Only 75 of 892 uploaders appear on 2+
   songs and 11 on 4+, so this data can train the shared model but cannot test personalization.
 
-Start with a pilot of about 5 songs and check the scores by ear before processing the full batch.
+Pilot first (5 songs, `PILOT_SONGS`), checked by ear, before processing the full batch.
 
 ## Original songs (`originals_data/`)
 
@@ -101,13 +105,24 @@ source of the target notes: Demucs vocal stem -> PESTO -> notes. Same handling r
   config), and pilot songs also get a **beep check**: target notes rendered as tones over the original,
   checked by ear.
 - **Octaves:** the recording-level octave goes into `transpose` (e.g. -12 for a man singing a song an
-  octave down). Within a phrase, short octave jumps (tracker glitches, about <= 150 ms, configurable) are
-  folded back and count as correct; held notes in the wrong octave count as wrong. Both go into
-  `octave_error_rate`. Also write `accuracy_strict` (no folding) next to `accuracy`.
+  octave down). **A whole phrase sung one octave up or down** (>= 70% of its readings in that
+  octave, `phrase_octave_share`; e.g. a line too low for the singer) **counts as right** in `accuracy`
+  and is reported in `phrase_octave` (+1/-1); two octaves away never does (user, 2026-11-16, after
+  hearing such a phrase sung well but scored 0). Within the phrase's octave, short jumps (tracker
+  glitches, <= 150 ms, configurable) are folded back; held notes in another octave count as wrong.
+  `accuracy_strict` never forgives octaves and `octave_error_rate` counts every reading in another
+  octave than the take's, so range avoidance stays visible.
+- **Phrases every cover fails are dropped** (user, 2026-11-16): >= 3 scored covers and median
+  accuracy < 0.15 (`CONSENSUS_*` in `labeling/config.py`) means the answer key is wrong there (the
+  note maker followed another voice); `labeling/score_covers.py` drops the phrase from every cover
+  and lists it in `derived/scores/dropped_phrases.csv`. Songs with < 3 aligned covers cannot be
+  checked. The melody JSON keeps the phrase, so `phrase_position` is unchanged.
 - **Singer range:** estimating range from notes sung accurately leaks the label into the range
-  features (most cover singers have one song). Use **voice-type ranges** for covers (a few standard
-  ranges picked from the singer's median sung pitch) and **sweeps** for the team. Before trusting any
-  real result, run the **shuffle test**: retrain with ranges shuffled between singers; if scores
+  features (most cover singers have one song). **Every cover singer gets one default range**,
+  MIDI 52-72 (E3-C5, `COVER_RANGE_MIDI`; user, 2026-11-17), and the team gets **sweeps**. Voice types
+  from the median sung pitch were tried and fail: covers keep the song's key, so the median measures
+  the song (30 of 34 pilot covers within 2.2 semitones of the song's median). `singers.csv` has
+  `range_source` (`default_cover` or `sweep`). Before trusting any real result, run the **shuffle test**: retrain with ranges shuffled between singers; if scores
   barely drop, range was not what worked, and if they collapse, look for leakage.
 - **phrase_position** uses the phrase count from `melodies/<song_id>.json` (`load_dataset` reads it),
   so rows rejected at the end of a song do not change it.
@@ -123,8 +138,23 @@ source of the target notes: Demucs vocal stem -> PESTO -> notes. Same handling r
     Pass 2 on the originals' own stems finds 96-98% of onsets at 10-40 ms median error; on aligned
     covers 60% at 90 ms, part singer, part pass 1's 100 ms map, not yet separated. Check timing labels
     before trusting them.
+  - *Pass 1b (fine-tuning, built 2026-11-16)* sits between them: every 1 s, a 4 s stretch of the
+    cover's backing onsets (drum hits, chord attacks; 10 ms frames) is lined up again with the song's
+    within +/-300 ms, against a straight line through pass 1's map; corrections are median-smoothed
+    over 5 windows and the map is rebuilt through one anchor per window. Still singer-independent.
+    On a real backing with a known cut, 2% slowdown and an inserted 150 ms gap, map error drops
+    from 22 ms median (p90 53) to 3 ms (p90 9). On the pilot covers only about half the windows find
+    a clear match (Smule backings are re-recordings); pass-2 onset error on aligned covers went
+    90 -> 84 ms median, within-100 ms 0.53 -> 0.58. In matched windows notes are still ~76 ms off,
+    so most of the remaining timing error is the singers (plus onset-detection noise on Demucs
+    vocals); unmatched windows are ~93 ms. Before/after beep files: `derived/beep_check/covers/`
+    vs `covers_before_refine/`; summaries `derived/alignment/summary.csv` vs `summary_before_refine.csv`.
   - librosa's subsequence DTW returns a wrong path when the query is longer than the reference, so
     `align._dtw` always puts the shorter recording first.
+  - Units trap: a "10 ms" hop at 22,050 Hz is 220 samples = 9.977 ms. `onset_envelope` resamples onto
+    an exact 10 ms grid; without that the error grows along the song (~30 ms by 45 s).
+  - Test-audio trap: librosa's `time_stretch`/`pitch_shift` (phase vocoder) smear drum hits ~50 ms
+    late, so pass 1b tests build fake covers by resampling and inserting silence instead.
   - Cover beep check (user, by ear): aligned covers sound "generally right but not 1:1". Measured with
     backing-track onsets in 4 s windows, pass 1's map is off by a median 30-190 ms locally (90% within
     180-430 ms; noisy measure, beat-period ambiguity). Fine for pitch where pass 2 finds the onset,
@@ -133,7 +163,12 @@ source of the target notes: Demucs vocal stem -> PESTO -> notes. Same handling r
     lead is silent there (ad-libs, harmonies, duet partner, humming), which is correctly unscored; the
     rest (11-44%) are notes the note maker dropped (< 80 ms, low confidence, ABBA's stacked harmonies).
 - **Tempo** comes from librosa's beat tracker on the original's backing. It doubles slow ballads
-  (Someone Like You 136, Fix You 144 instead of ~70); not fixed yet.
+  (Someone Like You 136, Fix You 144 instead of ~70), so `build_dataset.py` folds every tempo into
+  [60, 120) BPM (`TEMPO_BAND_MIN_BPM`): the feature only needs to be consistent.
+- **Quality flags are marked, not dropped:** `duet_flag` (> 35% of the singing where no target note
+  is due) and `pitch_correction_flag` (> 55% of the singing within 15 cents of a semitone).
+- **Singers are anonymous:** stable random ids `c0001...`; the uploader -> id and recording -> video
+  maps are in `derived/private/` (never share, never in the dataset folder).
 
 ## Labeling code (`labeling/`, run from the project folder)
 
@@ -142,51 +177,71 @@ source of the target notes: Demucs vocal stem -> PESTO -> notes. Same handling r
 | `config.py` | every rule and threshold, units in the names; `PILOT_SONGS`, `LEFT_OUT_SONGS` |
 | `pitch.py` | PESTO, every frame kept (`time_s`, `hz`, `midi`, `confidence`, `voiced`), 3 shifted copies |
 | `targets.py` | pitch -> `tuning_cents` -> notes -> phrases; `song_id_for()` slugs folder names |
-| `align.py` | pass 1 (`backing_chroma`, `align_backing`) and pass 2 (`find_onsets`, `recording_octave`) |
+| `align.py` | pass 1 (`backing_chroma`, `align_backing`), pass 1b (`onset_envelope`, `refine_alignment`) and pass 2 (`find_onsets`, `recording_octave`) |
 | `separate_originals.py` | Demucs on `originals_data/` -> `separated/originals/htdemucs/<song>/` |
 | `make_targets.py` | writes `ml/data/real/melodies/*.json` and `ml/data/real/songs.csv` |
 | `beep_check.py` | original + target beeps -> `derived/beep_check/` |
 | `align_covers.py` | both passes on every cover -> `derived/alignment/` (+ `summary.csv`, `--beeps N`) |
-| `tests/` | `py -m pytest labeling` (22 tests); `py -m pytest ml` (24 tests) |
+| `score_covers.py` | `scorer/` on every aligned cover -> `derived/scores/cover_scores.csv`; `--self-score`, `--clips N` |
+| `synthetic_singer.py` | step-3 checks with planted errors (test A synthetic voice, test B real voice) |
+| `build_dataset.py` | `ml/data/real/phrases_v1.0.parquet`, `singers.csv`, `songs.csv`; private maps in `derived/private/` |
+| `tests/` | `py -m pytest labeling` (31 tests); `py -m pytest ml` (24); `py -m pytest scorer` (26) |
 
-Order: `separate_originals.py` -> `make_targets.py` -> `beep_check.py` -> `align_covers.py`
+Order: `separate_originals.py` -> `make_targets.py` -> `beep_check.py` -> `align_covers.py` -> `score_covers.py` -> `build_dataset.py`
 (each takes `--all`; default is the 5 pilot songs). `derived/` and `ml/data/real/` are gitignored.
 Caches: `derived/pitch/{originals,covers}/` (PESTO), so re-runs are fast.
 
-## Next steps (agreed 2026-11-03, in order)
+## Teammate code on main (Arshiya, PRs #3-#5, merged 2026-11-05; reviewed 2026-11-16)
 
-1. **Fine-tuning step for pass 1.** Every few seconds, adjust the time map by cross-correlating the
-   backing tracks' onset envelopes (librosa `onset_strength`, 10 ms frames) within about +/-300 ms;
-   smooth the corrections; keep it singer-independent. Done when: a synthetic test with a known
-   offset passes, the pass-2 onset error on aligned covers drops well below ~90 ms, and re-rendered
-   cover beep files (same 7 aligned covers in `derived/beep_check/covers/`) sound in sync to the user.
-2. **Scorer** (`labeling/score.py`): per phrase `accuracy`, `accuracy_strict`, `mean_cents_error`,
-   `octave_error_rate`, `timing_accuracy`, `mean_onset_error_ms`, `missed_note_rate`, using the rules
-   in "Labeling decisions" (`tuning_cents`, octave rules, skip first 50 ms of each note, ~100 ms
-   smoothing, confidence threshold), all in `config.py`. Exact unit tests on synthetic pitch tracks.
-   Phrases with too few voiced frames are dropped and logged (NaN labels break training).
-3. **Labeling accuracy checks** (need the scorer):
-   - *Synthetic singer:* render a voice from a pilot song's target notes with planted errors (notes
-     +30 / +60 cents, notes 80 ms late, skipped notes, one phrase an octave down), mix over the
-     original's backing, run the whole pipeline as if it were a cover; labels must match the plants
-     within PESTO tolerances. This is the main test.
-   - *Self-score:* each original's vocal stem vs its own targets; flag songs below 0.85.
-   - *By ear:* the user listens to a few real cover phrases with very high and very low scores.
-4. **Pilot dataset:** `phrases_v1.0.parquet` in the contract format, `songs.csv`, `singers.csv` with
-   anonymous `singer_id`s (hash of uploader, mapping kept out of Git) and voice-type ranges. Fix the
-   tempo doubling. Add simple duet and pitch-correction flags (see "Cover recordings").
-5. **Test run through `ml/`** on the pilot data: only checks the plumbing (5 songs = 1 song per fold,
-   metrics are meaningless).
-6. **Scale up:** `--all` for every step (about 25 min Demucs, 4-5 h PESTO, 1.5 h alignment), spot-check
-   more beep files, then the real model run with the **shuffle test** before trusting any result.
+| Folder | What it does |
+|---|---|
+| `scorer/score.py` | pitch CSV (`program.py` format) + melody JSON -> phrase rows in the contract format. Global lag search (+/-0.6 s), key estimated from the singing (or `transpose` given), per-phrase DTW with a 100 ms band, `qc_flag`. All rules in its `Config`. |
+| `melody/extract_melody.py` | answer key from basic-pitch (or a karaoke MIDI): one melody line, merge/drop rules, phrases at 0.6 s rests (max 10 s), preview WAV, QC report, Krumhansl key guess. Its README has a basic-pitch install workaround (`pip install --no-deps basic-pitch`). |
+| `pipeline/run_pipeline.py` | team recordings: `data/songs/` + `data/recordings/<singer>/<song>_t<take>_k<key>.wav` -> parquet + report. |
+| `.github/workflows/tests.yml` | CI on Python 3.12: `pytest ml scorer melody pipeline` (not `labeling`). |
 
-Optional, only if step 6 is short of songs: single-DTW fallback for covers whose backing does not match
-(16 of 50 in the pilot), marked in a column.
-
-Housekeeping still open: fix `program.py` (empty paths crash, outputs overwrite each other,
-timestamps are ms but unlabelled, it deletes low-confidence frames; make it a thin wrapper around
-`labeling/pitch.py`), update README.md with the labeling pipeline, consider converting
-`requirements.txt` from UTF-16 to UTF-8 (Git shows it as binary). Nothing from 2026-11-03 is committed yet.
+What the review found (tested on the real pilot data, 2026-11-16):
+- **`scorer/` works on clean, in-sync pitch:** originals vs their own targets give median phrase
+  accuracy 0.79-0.92 (ABBA lowest: no `tuning_cents` support, ABBA is -24 cents).
+- **It cannot take covers raw** (median accuracy 0.20, wrong key on 8 of 34): their timelines differ
+  by more than its +/-0.6 s lag search. Fed with cover pitch moved onto the song timeline by our pass-1
+  map and the key passed in, it gives 0.51 median, close to our own estimate. So the plan is: covers go
+  through `labeling/align.py` first, then `scorer/`.
+- **Its timing labels are wrong even on the originals** (`timing_accuracy` 0.50-0.82 where ~1 is
+  right; covers 70-150 ms early): `onset_stats` takes the first in-tune run from 300 ms before the
+  note, which is often the end of the previous same-pitch note. `missed_note_rate` counts off-pitch
+  notes as missed (the contract says: no voiced frames).
+- **Changes made to `scorer/score.py` on 2026-11-16** (the user said go ahead; tell Arshiya, it is
+  their code; their 13 tests still pass, 13 exact tests added):
+  - `score_take(pitch, ..., tuning_cents=0.0)`: `pitch` is a CSV or a DataFrame of frames
+    (`time_s`, `midi`/`hz`, `confidence`); tuning removed before scoring; `--tuning-cents` on the CLI.
+  - Recording-level octave added to `transpose` (given or estimated). Octave rule: other-octave runs
+    <= 150 ms are glitches (count correct), longer runs count wrong. New columns `accuracy_strict`,
+    `octave_error_rate`. `mean_cents_error`/`bias_cents` stay pitch-class (folded).
+  - Smoothing is cut at jumps > 0.5 semitone between readings (it used to average across note
+    changes, costing in-tune singers accuracy at every note end and smearing octave glitches).
+  - Onsets: moves onto the note's pitch (0.75 semitone, octave-folded, 30 ms) nearest the note start
+    within +/-300 ms, from unsmoothed pitch; notes without one are left out of the timing labels.
+    `missed_note_rate` = no voiced reading while the note is due (the contract).
+  - Later the same day: a whole phrase one octave away counts as right (`phrase_octave`); octave runs
+    are not cut at gaps between notes; an onset needs the singer to stay on the note for 30% of it
+    (`onset_min_run_frac`).
+- Results with the updated scorer (before the phrase drops and the phrase-octave rule; current
+  numbers in `roadmap.md`): originals vs their own notes give accuracy 0.90-0.94 (was
+  0.79-0.92) and timing_accuracy 0.96-1.00 (was 0.50-0.82), onset error -25 to -1 ms. The 34 aligned
+  pilot covers (moved onto the song timeline by the pass-1b map, key passed in): median phrase
+  accuracy 0.49, accuracy_strict 0.47, octave_error_rate 0.02, timing_accuracy 0.60 (was 0.1-0.2),
+  mean onset error -6 ms (was -70 to -150), missed_note_rate 0. Per song accuracy: Fix You 0.72,
+  Bruno Mars 0.58, a-ha 0.50, Adele 0.49, ABBA 0.33. The planted-error tests (roadmap step 3) show
+  the pipeline reads accuracy within ~0.01-0.05, so ~0.5 is mostly the singers.
+- `labeling/align.find_onsets` (pass 2, now only used for diagnostics and beep files) still uses a
+  1-semitone onset tolerance, which misses onsets a semitone from the previous note; the scorer uses 0.75.
+- `pipeline/test_pipeline.py` is an exact copy of `fake_singer.py`: the pipeline has **no tests**,
+  though its README says it does. `melody` tests need `pretty_midi`, which no requirements file lists
+  (CI installs it ad hoc).
+- **Open decision:** which answer-key maker to keep (PESTO `labeling/targets.py` vs basic-pitch
+  `melody/`). Compare both on the 5 pilot songs by ear, then keep one; they also split phrases
+  differently (0.4 s rests vs 0.6 s rests with a 10 s cap).
 
 ## Data format (the contract with the data team)
 
@@ -209,7 +264,7 @@ Planned timing labels (the team wants timing to count too; support them as optio
 
 Supporting files:
 - `singers.csv`: `singer_id`, `range_low_midi`, `range_high_midi` (comfortable range from a sweep;
-  for covers, estimated from the notes the singer sings accurately)
+  for covers, one default range for everyone, since no sweeps exist), optional `range_source`
 - `songs.csv`: `song_id`, `tempo_bpm`, `original_key`, `language`, `genre`
 - `melodies/<song_id>.json`: `{"song_id", "tempo_bpm", "phrases": [[{"midi_pitch", "start_s",
   "duration_s"}, ...], ...]}` in the original key, for every song including ones nobody has recorded
@@ -277,7 +332,7 @@ recommend_key_from_notes(song_notes, singer_id, tempo_bpm=None) -> dict  # same,
 
 Save trained models with joblib.
 
-## Fake data generator (build this first)
+## Fake data generator (`ml/src/make_fake_data.py`, built)
 
 Generate data in the exact format above with **planted patterns** the model should recover:
 - 6 singers with different comfortable ranges and different skill offsets (e.g. +/-0.1 accuracy)
@@ -293,23 +348,31 @@ Generate data in the exact format above with **planted patterns** the model shou
 If a model cannot recover planted patterns (e.g. SHAP does not show `max_above_range` as
 important), there is a bug.
 
-## Suggested repo layout
+## Repo layout
 
 ```
+CLAUDE.md               # this file: rules, decisions, data format
+roadmap.md              # progress, results, next steps
+labeling/               # cover labeling pipeline (see "Labeling code")
+scorer/ melody/ pipeline/ program.py   # teammates' code (see "Teammate code on main")
 ml/
-  data/fake/            # generated fake data
+  data/fake/            # generated fake data (v0.0)
+  data/real/            # pilot dataset from labeling/ (gitignored)
   src/
     make_fake_data.py
     features.py         # target_notes -> feature row
-    evaluate.py         # GroupKFold, holdout, metrics, learning curve
+    evaluate.py         # load_dataset, GroupKFold, holdout, metrics, learning curve
+    train.py            # trains and scores every model, logs to MLflow, saves the shipped model
+    learning_curve.py
     models/
       baseline.py
+      linear.py
       xgb.py
-      hierarchical.py
+      hierarchical.py   # not built yet (ladder step 4)
     recommend.py        # predict() and recommend_key()
-  notebooks/            # exploration only
-  tests/                # unit tests for features and splits
+  tests/                # unit tests for features, splits, recommend
   requirements.txt
+derived/                # caches, alignment, scores, clips, private maps (gitignored)
 ```
 
 ## Tech stack
@@ -323,12 +386,3 @@ matplotlib, joblib, Weights & Biases or MLflow. PyTorch only for the optional st
 - Write unit tests for feature extraction and for the song-level split (check no song appears in
   both train and test).
 - Be suspicious of results that look too good; check for leakage first.
-
-## First tasks
-
-1. `make_fake_data.py` producing `phrases_v0.0.parquet`, `singers.csv`, `songs.csv`
-2. `features.py` with unit tests on a few hand-checked phrases
-3. `evaluate.py` with GroupKFold by song, holdout set, MAE and Spearman
-4. Baseline, then linear regression, then XGBoost; confirm XGBoost recovers the planted patterns
-5. Learning curve plot
-6. `recommend.py` with `predict` and `recommend_key`

@@ -39,12 +39,20 @@ class Config:
     """The label decisions the two teams agreed to settle. Change them here, in one place."""
     conf_threshold: float = 0.70      # readings below this are breaths, silence or consonants
     tolerance_cents: float = 50.0     # a reading is a hit if its error is within this
-    # the right note in the wrong octave counts as correct
+    # the right note in the wrong octave: a short jump (a tracker glitch) counts as correct, a held
+    # note in the other octave counts as wrong (agreed rule, CLAUDE.md "Octaves"). False = strict.
     octave_tolerant: bool = True
+    octave_glitch_s: float = 0.15     # wrong-octave runs up to this long are glitches
+    # a whole phrase sung one octave up or down (a line out of the singer's range) counts as right
+    # in `accuracy` when at least this share of its readings sit in that octave; None = never
+    phrase_octave_share: float = 0.7
     # ignore the first 50 ms of a note, the pitch is still sliding
     skip_note_start_s: float = 0.05
     # smooth over 100 ms so vibrato doesn't count as wrong notes
     smooth_s: float = 0.10
+    # but never across a jump this big between two 10 ms readings (a note change or an octave
+    # glitch); vibrato moves at most about 0.35 semitone per reading, so it is still smoothed
+    smooth_break_semitones: float = 0.5
     # after the global offset, DTW may move time by this much
     band_s: float = 0.10
     step_penalty: float = 0.3         # extra cost for each time-stretching DTW step
@@ -53,6 +61,13 @@ class Config:
     min_scored_frames: int = 10       # drop phrases with fewer scored readings than this
     # a note started "on time" if within this of its start
     onset_tolerance_ms: float = 100
+    onset_search_s: float = 0.3       # look this far either side of a note's start for its onset
+    # "singing this note" for onset finding (octave-folded); must stay below 1, or the previous
+    # note a semitone away already counts as this one and there is no onset to find
+    onset_pitch_semitones: float = 0.75
+    onset_min_run_s: float = 0.03     # the singer must stay near the note this long...
+    onset_min_run_frac: float = 0.3   # ...and at least this share of the note (so a flicker into
+                                      # range during a slide does not count as arriving)
     key_search: int = 6               # try transposes from -6 to +6 semitones
 
 
@@ -65,27 +80,42 @@ def hz_to_midi(hz):
     return out
 
 
-def load_pitch(path, cfg):
-    """MIDI pitch for every 10 ms frame; NaN where there is no confident pitch."""
-    df = pd.read_csv(path)
-    t = df["timestamp"].to_numpy(dtype=float)
-    if len(t) > 1 and np.median(np.diff(t)) > 1.0:
-        t = t / 1000.0  # PESTO writes milliseconds; seconds files have steps of about 0.01
-    midi = hz_to_midi(df["frequency"].to_numpy())
-    midi[df["confidence"].to_numpy() < cfg.conf_threshold] = np.nan
+def load_pitch(source, cfg):
+    """MIDI pitch for every 10 ms frame; NaN where there is no confident pitch.
+
+    source: a pitch CSV from program.py (timestamp, frequency, confidence), or a DataFrame of
+    frames with time_s (seconds), midi or hz, and confidence (labeling/pitch.py's format, e.g. a
+    cover already moved onto the song's timeline by labeling/align.py)."""
+    if isinstance(source, pd.DataFrame):
+        t = source["time_s"].to_numpy(dtype=float)
+        midi = (source["midi"].to_numpy(dtype=float) if "midi" in source
+                else hz_to_midi(source["hz"].to_numpy()))
+        confidence = source["confidence"].to_numpy(dtype=float)
+    else:
+        df = pd.read_csv(source)
+        t = df["timestamp"].to_numpy(dtype=float)
+        if len(t) > 1 and np.median(np.diff(t)) > 1.0:
+            t = t / 1000.0  # PESTO writes milliseconds; seconds files have steps of about 0.01
+        midi = hz_to_midi(df["frequency"].to_numpy())
+        confidence = df["confidence"].to_numpy(dtype=float)
+    midi = midi.copy()
+    midi[confidence < cfg.conf_threshold] = np.nan
 
     grid = np.full(int(round(t.max() / HOP_S)) + 1, np.nan)
     grid[np.round(t / HOP_S).astype(int)] = midi
     return grid
 
 
-def smooth_voiced(midi, width):
-    """Moving average inside each unbroken run of voiced frames (removes vibrato wobble)."""
+def smooth_voiced(midi, width, break_semitones=np.inf):
+    """Moving average inside each unbroken run of voiced frames (removes vibrato wobble). A run
+    is also cut where the pitch jumps more than break_semitones between two readings, so a note
+    change or an octave glitch stays sharp instead of being averaged into in-between pitches."""
     out = midi.copy()
     voiced = np.flatnonzero(np.isfinite(midi))
     if len(voiced) == 0 or width <= 1:
         return out
-    for run in np.split(voiced, np.flatnonzero(np.diff(voiced) > 1) + 1):
+    cut = (np.diff(voiced) > 1) | (np.abs(np.diff(midi[voiced])) > break_semitones)
+    for run in np.split(voiced, np.flatnonzero(cut) + 1):
         k = min(width, len(run))
         padded = np.pad(midi[run], (k // 2, k - 1 - k // 2), mode="edge")
         out[run] = np.convolve(padded, np.ones(k) / k, mode="valid")
@@ -214,19 +244,55 @@ def dtw_align(cost, center, radius, penalty):
     path.reverse()
     return np.array([p[0] for p in path]), np.array([p[1] for p in path])
 
-def summarize_errors(sung_midi, target_midi, tolerance_cents=50.0, octave_tolerant=True):
-    """The phrase label from matched readings, or None if there is nothing to score."""
+def summarize_errors(sung_midi, target_midi, tolerance_cents=50.0, octave_tolerant=True,
+                     frame_idx=None, glitch_frames=15, phrase_octave_share=None):
+    """The phrase label from matched readings, or None if there is nothing to score.
+
+    A reading is "in another octave" when it is more than half an octave from the target.
+
+    Whole phrase moved an octave (agreed 2026-11-16): if phrase_octave_share is given and at least
+    that share of the readings sit exactly one octave up (or down), the singer chose that octave
+    for the phrase (e.g. a line too low for them). `accuracy` then judges the phrase in that octave;
+    `phrase_octave` reports it (+1 / -1, else 0). Two octaves away is never allowed.
+
+    With octave_tolerant, a run of readings in another octave than the phrase's (in time order,
+    across gaps between notes) spanning no more than glitch_frames of frame_idx is a tracker glitch
+    and is folded back; a longer run is a held note in the wrong octave and counts as wrong.
+
+    accuracy_strict never folds or moves octaves, and octave_error_rate is the share of readings in
+    another octave than the take's, so octave choices stay visible in both."""
     err = 100.0 * (np.asarray(sung_midi, dtype=float) -
                    np.asarray(target_midi, dtype=float))
     if len(err) == 0:
         return None
-    used = fold_cents(err) if octave_tolerant else err
+    octaves = np.round(err / 1200.0)
+    phrase_octave = 0
+    if phrase_octave_share is not None:
+        values, counts = np.unique(octaves, return_counts=True)
+        best = int(values[np.argmax(counts)])
+        if abs(best) == 1 and counts.max() / len(err) >= phrase_octave_share:
+            phrase_octave = best
+    rel = err - 1200.0 * phrase_octave                 # error in the phrase's chosen octave
+    folded = fold_cents(err)
+    other_octave = np.round(rel / 1200.0) != 0
+    used = rel.copy()
+    if octave_tolerant:
+        idx = np.arange(len(err)) if frame_idx is None else np.asarray(frame_idx)
+        # runs of other-octave readings, broken only where the octave state changes
+        breaks = np.flatnonzero(np.diff(other_octave.astype(int)) != 0) + 1
+        for run in np.split(np.arange(len(err)), breaks):
+            if other_octave[run[0]] and idx[run[-1]] - idx[run[0]] + 1 <= glitch_frames:
+                used[run] = folded[run]
     return {
         "accuracy": float(np.mean(np.abs(used) <= tolerance_cents)),
-        "mean_cents_error": float(np.mean(np.abs(used))),
+        "accuracy_strict": float(np.mean(np.abs(err) <= tolerance_cents)),
+        "octave_error_rate": float(np.mean(octaves != 0)),
+        "phrase_octave": phrase_octave,
+        # pitch-class error, so one held wrong octave does not add 1200 cents per reading
+        "mean_cents_error": float(np.mean(np.abs(folded))),
         "n_scored": int(len(err)),
         # positive = tends sharp, negative = tends flat
-        "bias_cents": float(np.mean(used)),
+        "bias_cents": float(np.mean(folded)),
     }
 
 
@@ -243,7 +309,7 @@ def score_phrase(sung_padded, target_padded, since_padded, a, b, pad, cfg):
         return None
     rows, cols = aligned
 
-    sung_vals, target_vals = [], []
+    sung_vals, target_vals, frames = [], [], []
     # one singing frame can match several target frames: take the middle one
     for j in np.unique(cols):
         i = int(np.median(rows[cols == j]))
@@ -251,33 +317,47 @@ def score_phrase(sung_padded, target_padded, since_padded, a, b, pad, cfg):
         if np.isfinite(sung) and np.isfinite(target) and since >= cfg.skip_note_start_s:
             sung_vals.append(sung)
             target_vals.append(target)
-    return summarize_errors(sung_vals, target_vals, cfg.tolerance_cents, cfg.octave_tolerant)
+            frames.append(j)
+    return summarize_errors(sung_vals, target_vals, cfg.tolerance_cents, cfg.octave_tolerant,
+                            frames, int(round(cfg.octave_glitch_s / HOP_S)), cfg.phrase_octave_share)
 
 
 def onset_stats(sung, notes, cfg):
     """Timing labels for a phrase: how late or early each note started, and which were missed.
 
-    A note "starts" at the first run of 3 readings (30 ms) within the pitch tolerance of the note.
-    The tolerance must stay below a semitone, or a neighbouring note would look like this one."""
+    sung: unsmoothed MIDI per frame (smoothing would blur where notes start), already in the
+    original key. A note's onset is where the singer moves ONTO its pitch (octave-folded, within
+    onset_pitch_semitones) and stays for onset_min_run_s and onset_min_run_frac of the note; of those, the one closest to the note's
+    start within +/-onset_search_s. Requiring a move onto the pitch stops the end of a previous
+    same-pitch note from counting as this note's start. Notes with no such onset (legato into the
+    same pitch, or not sung) are left out of the timing labels.
+
+    timing_accuracy = share of found onsets within onset_tolerance_ms; missed_note_rate = share of
+    notes with no voiced reading at all while they are due (the data contract's definition)."""
+    reach = int(round(cfg.onset_search_s / HOP_S))
     errors, missed = [], 0
     for pitch, start, dur in notes:
-        a = max(int((start - 0.3) / HOP_S), 0)
-        b = min(int((start + dur) / HOP_S), len(sung))
-        segment = sung[a:b]
-        close = np.isfinite(segment) & (
-            np.abs(fold_cents(100.0 * (segment - pitch))) <= cfg.tolerance_cents)
-        runs = np.flatnonzero(np.convolve(close, np.ones(
-            3), mode="valid") == 3) if len(close) >= 3 else []
-        if len(runs) == 0:
+        min_run = max(1, int(round(max(cfg.onset_min_run_s, cfg.onset_min_run_frac * dur) / HOP_S)))
+        s0 = int(round(start / HOP_S))
+        a, b = max(s0, 0), min(int(round((start + dur) / HOP_S)), len(sung))
+        if not np.isfinite(sung[a:b]).any():
             missed += 1
-        else:
-            errors.append((a + runs[0]) * HOP_S - start)
-    n = len(notes)
+        lo, hi = max(s0 - reach, 1), min(s0 + reach, len(sung) - min_run)
+        if hi <= lo:
+            continue
+        segment = sung[lo - 1: hi + min_run]
+        close = np.isfinite(segment) & (
+            np.abs((np.nan_to_num(segment) - pitch + 6.0) % 12.0 - 6.0) <= cfg.onset_pitch_semitones)
+        starts = [i for i in range(1, hi - lo + 1)
+                  if close[i] and not close[i - 1] and close[i:i + min_run].all()]
+        if starts:
+            best = min(starts, key=lambda i: abs(lo - 1 + i - s0))
+            errors.append((lo - 1 + best - s0) * HOP_S)
     on_time = sum(abs(e) * 1000 <= cfg.onset_tolerance_ms for e in errors)
     return {
-        "timing_accuracy": on_time / n,
+        "timing_accuracy": on_time / len(errors) if errors else float("nan"),
         "mean_onset_error_ms": float(np.mean(errors) * 1000) if errors else float("nan"),
-        "missed_note_rate": missed / n,
+        "missed_note_rate": missed / len(notes),
     }
 
 
@@ -288,32 +368,51 @@ def shift_notes(notes, transpose):
 
 COLUMNS = ["song_id", "singer_id", "take_id", "transpose", "phrase_idx", "target_notes", "accuracy",
            "mean_cents_error", "timing_accuracy", "mean_onset_error_ms", "missed_note_rate",
+           "accuracy_strict", "octave_error_rate", "phrase_octave",
            "n_scored", "bias_cents", "lag_s", "transpose_conf", "transpose_source", "qc_flag"]
 
 
-def score_take(pitch_csv, melody_json, singer_id, take_id=1, transpose=None, cfg=None):
-    """Score one recording. Pass `transpose` when it is known; otherwise it is estimated.
+def recording_octave(sung, target, transpose):
+    """The octave (a multiple of 12) the singer used relative to the key-shifted notes, from the
+    median gap while notes are due. A man singing a woman's song an octave down gets -12, which
+    goes into `transpose` so the range features describe what he actually sang."""
+    n = min(len(sung), len(target))
+    gap = sung[:n] - target[:n] - transpose
+    gap = gap[np.isfinite(gap)]
+    return int(12 * np.round(np.median(gap) / 12)) if len(gap) else 0
+
+
+def score_take(pitch, melody_json, singer_id, take_id=1, transpose=None, cfg=None, tuning_cents=0.0):
+    """Score one recording. Pass `transpose` when the key is known; otherwise it is estimated.
+    Either way the octave the singer used is found and added to it.
+
+    pitch: a pitch CSV path or a DataFrame of frames (see load_pitch)
+    tuning_cents: how far the original song sits from A440 (songs.csv), removed before scoring
     Returns a DataFrame in the dataset format. df.attrs["dropped_phrases"] counts skipped phrases."""
     cfg = cfg or Config()
     song_id, _, phrases = load_melody(melody_json)
     all_notes = [n for phrase in phrases for n in phrase]
-    sung = smooth_voiced(load_pitch(pitch_csv, cfg),
-                         int(round(cfg.smooth_s / HOP_S)))
+    raw = load_pitch(pitch, cfg) - tuning_cents / 100.0
+    sung = smooth_voiced(raw, int(round(cfg.smooth_s / HOP_S)), cfg.smooth_break_semitones)
 
     n_frames = max(len(sung), int(
         np.ceil(max(s + d for _, s, d in all_notes) / HOP_S)) + 1)
     target, _ = notes_to_curve(all_notes, n_frames)
     sung_full = np.full(n_frames, np.nan)
     sung_full[: len(sung)] = sung
+    raw_full = np.full(n_frames, np.nan)
+    raw_full[: len(raw)] = raw
 
     lag = estimate_global_lag(sung_full, target, cfg.max_lag_s)
     sung_full = shift_left(sung_full, lag)
+    raw_full = shift_left(raw_full, lag)
 
     if transpose is None:
         transpose, confidence = estimate_transpose(sung_full, target, cfg)
         source = "estimated"
     else:
         confidence, source = float("nan"), "given"
+    transpose = int(transpose) + recording_octave(sung_full, target, transpose)
 
     flags = []
     due = np.isfinite(target)
@@ -345,12 +444,13 @@ def score_take(pitch_csv, melody_json, singer_id, take_id=1, transpose=None, cfg
         if result is None or result["n_scored"] < cfg.min_scored_frames:
             dropped += 1
             continue
-        timing = onset_stats(sung_full - transpose, notes, cfg)
+        timing = onset_stats(raw_full - transpose, notes, cfg)
         rows.append({
             "song_id": song_id, "singer_id": singer_id, "take_id": int(take_id),
             "transpose": int(transpose), "phrase_idx": idx,
             "target_notes": shift_notes(notes, transpose),
             **{k: result[k] for k in ("accuracy", "mean_cents_error")}, **timing,
+            **{k: result[k] for k in ("accuracy_strict", "octave_error_rate", "phrase_octave")},
             "n_scored": result["n_scored"], "bias_cents": result["bias_cents"],
             "lag_s": lag * HOP_S, "transpose_conf": confidence, "transpose_source": source,
             "qc_flag": ";".join(flags),
@@ -384,10 +484,12 @@ def main():
                         help="leave out to estimate the key")
     parser.add_argument("--out", type=Path,
                         help="parquet file to create or add to")
+    parser.add_argument("--tuning-cents", type=float, default=0.0,
+                        help="how far the original sits from A440 (songs.csv tuning_cents)")
     args = parser.parse_args()
 
     df = score_take(args.pitch, args.melody, args.singer_id,
-                    args.take, args.transpose)
+                    args.take, args.transpose, tuning_cents=args.tuning_cents)
     print(df.drop(columns="target_notes").round(2).to_string(index=False))
     print(
         f"dropped phrases (too little singing): {df.attrs['dropped_phrases']}")

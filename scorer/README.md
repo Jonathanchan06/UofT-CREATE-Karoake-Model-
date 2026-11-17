@@ -31,6 +31,19 @@ recordings, where you chose the key).
    gets the flag `unsure_key`.
 6. **Bad takes are flagged, not hidden.** `qc_flag` can hold `mostly_silent`, `unsure_key` or
    `lag_at_limit`. Phrases with fewer than 10 scored readings are dropped.
+7. **Octaves (agreed rule).** The octave the singer used for the whole take is found and added to
+   `transpose` (e.g. -12 for a man singing a woman's song an octave down). Inside a phrase, a jump
+   to another octave lasting up to 150 ms is a tracker glitch and still counts as correct; a held
+   note in the other octave counts as wrong. `accuracy_strict` never forgives octaves.
+8. **Smoothing never crosses a note change.** The 100 ms average that removes vibrato is cut
+   wherever the pitch jumps more than half a semitone between two readings.
+9. **Onsets are moves onto the note.** A note starts where the singer moves onto its pitch (within
+   0.75 semitone, any octave) and stays 30 ms, closest to the note's start within +/-300 ms. The
+   end of a previous note on the same pitch is never taken as this note's start.
+
+Covers reach the scorer through `labeling/align.py`, which moves their pitch onto the song's
+timeline and finds the key. `score_take` accepts those pitch frames as a DataFrame (`time_s`,
+`midi` or `hz`, `confidence`) as well as a CSV, plus `tuning_cents` from `songs.csv`.
 
 ## Output columns
 
@@ -39,6 +52,8 @@ The first eleven match the contract in `CLAUDE.md`. `target_notes` is already sh
 
 | Column | Meaning |
 |---|---|
+| `accuracy_strict` | like `accuracy`, but a reading in the wrong octave is always a miss |
+| `octave_error_rate` | share of readings in another octave (glitches and held notes) |
 | `n_scored` | readings the accuracy is based on |
 | `bias_cents` | positive means tends sharp, negative means tends flat |
 | `lag_s` | whole-take timing offset that was removed |
@@ -55,8 +70,10 @@ All the rules the two teams need to agree on live in the `Config` class at the t
 
 - Timing labels are measured after the whole-take offset is removed, so a take that is late
   everywhere shows lag in `lag_s`, not in the onset errors.
-- Onset detection is approximate. A note counts as started at the first 30 ms of pitch within
-  tolerance of it.
+- Notes with no clear onset (legato into the same pitch, or not sung) are left out of
+  `timing_accuracy` and `mean_onset_error_ms`. `missed_note_rate` is the share of notes with no
+  voiced reading at all while they are due; an off-pitch note is not missed.
 - The key estimate assumes one key for the whole take. A singer who changes key midway will get a
   low confidence and the `unsure_key` flag.
-- Tested on synthetic pitch only. The first real recording is the real test.
+- Tested on the 5 pilot songs (2026-11-16): the originals scored against their own notes give
+  accuracy 0.90-0.94 and timing_accuracy 0.96-1.00. See CLAUDE.md for the cover results.

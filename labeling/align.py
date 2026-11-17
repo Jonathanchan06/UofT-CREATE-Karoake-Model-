@@ -5,6 +5,10 @@ original's, using chroma (energy in each of the 12 note names) and DTW. This giv
 cover time <-> song time and the cover's key shift. The singer is not involved, so their
 mistakes cannot bend the map.
 
+Pass 1b (fine-tuning, also singer-independent): chroma is only good to about 100 ms, so every
+second the map is nudged by lining up the backing tracks' onsets (drum hits, chord attacks) in
+10 ms steps within +/-300 ms.
+
 Pass 2 (per note): with the map in place, look within +/-ONSET_SEARCH_S of where each target note
 should start for where the singer actually started it. That offset is the timing error.
 
@@ -99,6 +103,97 @@ def align_backing(cover_chroma, cover_loudness, song_chroma):
     slope = float((song_t[-1] - song_t[0]) / max(cover_t[-1] - cover_t[0], hop))
     return {"key_shift": int(key), "cost": cost, "slope": slope, "cover_t": cover_t, "song_t": song_t,
             "song_start_s": float(song_t[0]), "song_end_s": float(song_t[-1])}
+
+
+# ---------- Pass 1b: fine-tune the map ----------
+
+def onset_envelope(path):
+    """Onset strength of an audio file (peaks at drum hits and chord attacks), one value per
+    ONSET_HOP_S, standardised to mean 0 and sd 1."""
+    y, sr = librosa.load(path, sr=config.ALIGN_SAMPLE_RATE, mono=True)
+    hop = int(round(config.ONSET_HOP_S * sr))
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    # 220 samples at 22050 Hz is 9.977 ms, not 10: put the frames on an exact ONSET_HOP_S grid,
+    # or the error grows along the song (about 30 ms by 45 s)
+    frame_s = np.arange(len(env)) * hop / sr
+    env = np.interp(np.arange(0, frame_s[-1], config.ONSET_HOP_S), frame_s, env)
+    return (env - env.mean()) / (env.std() + 1e-9)
+
+
+def refine_alignment(alignment, cover_env, song_env):
+    """Pass 1b. Chroma (pass 1) finds the right part of the song but is only good to about 100 ms.
+    Every REFINE_STEP_S, take REFINE_WINDOW_S of the cover's backing onsets and find the shift
+    (within +/-REFINE_MAX_SHIFT_S) that best lines them up with the song's backing onsets around
+    where pass 1 maps them. Corrections are median-smoothed and added to the map. Uses only the
+    backing tracks, never the singer.
+
+    Returns a new alignment dict with song_t corrected, plus refine_windows (how many),
+    refine_used (share with a clear match) and refine_median_abs_ms (typical correction)."""
+    hop = config.ONSET_HOP_S
+    win = int(round(config.REFINE_WINDOW_S / hop))
+    lags_s = np.arange(-round(config.REFINE_MAX_SHIFT_S / hop), round(config.REFINE_MAX_SHIFT_S / hop) + 1) * hop
+    cover_t, song_t = alignment["cover_t"], alignment["song_t"]
+    song_grid = np.arange(len(song_env)) * hop
+
+    centres, line_at_centre, shifts = [], [], []
+    for centre in np.arange(cover_t[0] + config.REFINE_WINDOW_S / 2,
+                            cover_t[-1] - config.REFINE_WINDOW_S / 2, config.REFINE_STEP_S):
+        c0 = int(round(centre / hop)) - win // 2
+        cover_win = cover_env[max(c0, 0):c0 + win]
+        window_t = (c0 + np.arange(win)) * hop
+        # Pass 1's map wobbles from frame to frame; use a straight line through it in this window
+        # (follows tempo differences, drops the wobble)
+        slope, intercept = np.polyfit(window_t, np.interp(window_t, cover_t, song_t), 1)
+        centres.append(centre)
+        line_at_centre.append(slope * centre + intercept)
+        if c0 < 0 or len(cover_win) < win:
+            shifts.append(np.nan)
+            continue
+        # The song's onsets along that line, shifted by each candidate lag: one row per lag
+        mapped = slope * window_t + intercept
+        candidates = np.interp(mapped[None, :] + lags_s[:, None], song_grid, song_env)
+        a = candidates - candidates.mean(axis=1, keepdims=True)
+        b = cover_win - cover_win.mean()
+        r = (a @ b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b) + 1e-9)
+        score = np.where(r >= config.REFINE_MIN_CORR, r - config.REFINE_LAG_PENALTY * np.abs(lags_s), -np.inf)
+        shifts.append(lags_s[np.argmax(score)] if np.isfinite(score.max()) else np.nan)
+
+    shifts = pd.Series(shifts, dtype=float)
+    used = float(shifts.notna().mean()) if len(shifts) else 0.0
+    smoothed = shifts.rolling(config.REFINE_SMOOTH_WINDOWS, center=True, min_periods=1).median()
+    ok = smoothed.notna().to_numpy()
+    refined = dict(alignment)
+    if ok.any():
+        # New map through one corrected anchor per window; outside the first/last anchor, pass 1's
+        # map moved by the nearest correction
+        anchor_c = np.array(centres)[ok]
+        anchor_s = np.array(line_at_centre)[ok] + smoothed.to_numpy()[ok]
+        new_t = np.interp(cover_t, anchor_c, anchor_s)
+        before, after = cover_t < anchor_c[0], cover_t > anchor_c[-1]
+        new_t[before] = song_t[before] + (anchor_s[0] - np.interp(anchor_c[0], cover_t, song_t))
+        new_t[after] = song_t[after] + (anchor_s[-1] - np.interp(anchor_c[-1], cover_t, song_t))
+        refined["song_t"] = np.maximum.accumulate(new_t)
+        refined["song_start_s"] = float(refined["song_t"][0])
+        refined["song_end_s"] = float(refined["song_t"][-1])
+    refined.update(refine_centres=np.array(centres), refine_shifts=shifts.to_numpy(),
+                   refine_windows=len(centres), refine_used=used,
+                   refine_median_abs_ms=float(np.nanmedian(np.abs(smoothed)) * 1000) if ok.any() else 0.0)
+    return refined
+
+
+def to_song_timeline(frames, alignment, hop_s=0.01):
+    """A cover's pitch frames (pitch.track_pitch format) moved onto the song's timeline with the
+    time map, on a hop_s grid from 0 (nearest cover frame). Frames outside the part of the song the
+    cover covers are unvoiced. This is what the scorer takes for covers."""
+    cover_t, song_t = alignment["cover_t"], alignment["song_t"]
+    inside = frames[(frames["time_s"] >= cover_t[0]) & (frames["time_s"] <= cover_t[-1])]
+    mapped = np.interp(inside["time_s"], cover_t, song_t)
+    grid = np.round(np.arange(0, mapped.max() + hop_s, hop_s), 6)
+    idx = np.clip(np.searchsorted(mapped, grid), 0, len(mapped) - 1)
+    close = np.abs(mapped[idx] - grid) <= hop_s
+    return pd.DataFrame({"time_s": grid,
+                         "midi": np.where(close, inside["midi"].to_numpy()[idx], np.nan),
+                         "confidence": np.where(close, inside["confidence"].to_numpy()[idx], 0.0)})
 
 
 def song_to_cover_time(alignment, song_s):
